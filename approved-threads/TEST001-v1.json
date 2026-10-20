@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "approved": true,
+  "account": "wannasaybutdidnt",
+  "approval_ref": "TEST001-v1",
+  "approved_at": 1792490112,
+  "text": "這是一則發布連線測試。",
+  "attachment": "",
+  "sha256": "e9074b153c324b62171bd356212671997dbceabf63a7151cc2672a1a8d050a55"
+}
