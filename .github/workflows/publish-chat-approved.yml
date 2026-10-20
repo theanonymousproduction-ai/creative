@@ -1,0 +1,46 @@
+name: Publish Chat-approved Threads post
+on:
+  push:
+    branches: [main]
+    paths: ['approved-threads/*.json']
+permissions:
+  contents: read
+  deployments: write
+concurrency:
+  group: threads-publishing
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      THREADS_BRIDGE_API_KEY: ${{ secrets.THREADS_BRIDGE_API_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      BEFORE_SHA: ${{ github.event.before }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Publish only newly added approved jobs from this commit
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess, sys
+          before, current = os.environ['BEFORE_SHA'], os.environ['GITHUB_SHA']
+          if not re.fullmatch(r'[0-9a-f]{40}', before) or before == '0' * 40:
+              raise SystemExit('Cannot establish approved commit range; no post sent')
+          result = subprocess.check_output(['git', 'diff', '--name-status', '--diff-filter=A', before, current, '--', 'approved-threads/*.json'], text=True)
+          paths = [line.split('\t', 1)[1] for line in result.splitlines() if line.startswith('A\t')]
+          if len(paths) != 1:
+              raise SystemExit('Require exactly one new chat-approved job per commit; no post sent')
+          subprocess.run([sys.executable, 'scripts/publish_chat_approved.py', *paths], check=True)
+          PY
+      - name: Save publication receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: threads-publication-receipt
+          path: publish-receipt.json
+          if-no-files-found: ignore
+          retention-days: 90

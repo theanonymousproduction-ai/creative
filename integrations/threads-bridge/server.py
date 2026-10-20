@@ -84,7 +84,7 @@ def check_account():
     return data
 
 
-def validate_text(text):
+def validate_text(text, limit=500):
     if not isinstance(text, str) or not text.strip():
         raise Problem(400, 'text_required')
     text = text.strip()
@@ -92,8 +92,8 @@ def validate_text(text):
         units = len(text.encode('utf-16-le')) // 2
     except UnicodeEncodeError:
         raise Problem(400, 'invalid_text') from None
-    if units > 500:
-        raise Problem(400, 'text_too_long', counted_units=units, limit=500)
+    if units > limit:
+        raise Problem(400, 'text_too_long', counted_units=units, limit=limit)
     return text, units
 
 
@@ -105,7 +105,7 @@ def signed_ticket(payload):
 
 
 def read_ticket(ticket):
-    if not isinstance(ticket, str) or len(ticket) > 16000:
+    if not isinstance(ticket, str) or len(ticket) > 200000:
         raise Problem(400, 'invalid_preview_ticket')
     try:
         body, signature = ticket.rsplit('.', 1)
@@ -124,10 +124,14 @@ def read_ticket(ticket):
 
 def preview(body):
     text, units = validate_text(body.get('text'))
+    attachment = body.get('attachment', '')
+    if not isinstance(attachment, str):
+        raise Problem(400, 'invalid_attachment')
+    attachment = validate_text(attachment, limit=10000)[0] if attachment.strip() else ''
     user = check_account()
     payload = {'account_id': user['id'], 'username': user['username'], 'text': text,
-               'expires': int(time.time()) + 600, 'ticket_id': secrets.token_hex(16)}
-    return {'account': user, 'text': text, 'counted_units': units,
+               'attachment': attachment, 'expires': int(time.time()) + 600, 'ticket_id': secrets.token_hex(16)}
+    return {'account': user, 'text': text, 'attachment': attachment, 'counted_units': units,
             'ticket': signed_ticket(payload), 'expires_in_seconds': 600}
 
 
@@ -156,10 +160,14 @@ def publish(body):
         raise Problem(400, 'explicit_approval_required')
     payload = read_ticket(body.get('ticket'))
     text, _ = validate_text(payload.get('text'))
+    attachment = payload.get('attachment', '')
+    if not isinstance(attachment, str):
+        raise Problem(400, 'invalid_attachment')
+    attachment = validate_text(attachment, limit=10000)[0] if attachment.strip() else ''
     user = check_account()
     if payload.get('account_id') != user['id'] or payload.get('username') != user['username']:
         raise Problem(409, 'account_changed_since_preview')
-    digest = hashlib.sha256((user['id'] + '\0' + text).encode()).hexdigest()
+    digest = hashlib.sha256((user['id'] + '\0' + text + ('\0attachment\0' + attachment if attachment else '')).encode()).hexdigest()
     conn = database()
     try:
         conn.execute('BEGIN IMMEDIATE')
@@ -176,7 +184,10 @@ def publish(body):
         conn.close()
     # From this point any error is retained as uncertain: never automatically retry a post.
     try:
-        container = meta('/' + user['id'] + '/threads', {'media_type': 'TEXT', 'text': text})
+        form = {'media_type': 'TEXT', 'text': text}
+        if attachment:
+            form['text_attachment'] = json.dumps({'plaintext': attachment}, ensure_ascii=False)
+        container = meta('/' + user['id'] + '/threads', form)
         cid = str(container.get('id', ''))
         if not cid.isdigit():
             raise Problem(502, 'unexpected_container_response')
@@ -244,7 +255,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             if self.path == '/health':
-                return self.respond(200, {'ok': True, 'version': 'preview-publish-v1'})
+                return self.respond(200, {'ok': True, 'version': 'chat-approval-v2'})
             if self.path == '/':
                 nonce = secrets.token_urlsafe(24)
                 page = (ROOT / 'publisher.html').read_text().replace('__NONCE__', nonce)
@@ -278,7 +289,7 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get('Content-Length', '0'))
             except ValueError:
                 raise Problem(400, 'invalid_body_length') from None
-            if length < 1 or length > 32768:
+            if length < 1 or length > 262144:
                 raise Problem(413, 'invalid_body_size')
             if self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
                 raise Problem(415, 'json_required')

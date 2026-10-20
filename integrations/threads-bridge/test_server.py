@@ -150,6 +150,18 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(second['already_processed'])
         self.assertEqual(sum(p == '/123/threads_publish' for p, _ in self.calls), 1)
 
+    def test_long_attachment_is_bound_to_preview_and_meta_form(self):
+        article = '完整故事' * 150
+        data = bridge.preview({'text': '故事標題', 'attachment': article})
+        self.assertEqual(data['attachment'], article)
+        self.assertEqual(bridge.read_ticket(data['ticket'])['attachment'], article)
+        result = self.submit(data['ticket'])
+        self.assertEqual(result['state'], 'published')
+        form = next(form for path, form in self.calls if path == '/123/threads')
+        self.assertEqual(json.loads(form['text_attachment'])['plaintext'], article)
+        self.assertEqual(form['text'], '故事標題')
+        self.assert_problem(400, lambda: bridge.preview({'text':'標題', 'attachment':'字' * 10001}))
+
     def test_http_auth_origin_ui_and_preview(self):
         server = bridge.ThreadingHTTPServer(('127.0.0.1', 0), bridge.Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True);thread.start()

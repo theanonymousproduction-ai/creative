@@ -9,7 +9,7 @@
 - POST /preview：同源、密鑰認證、500單位內文字、核對預期帳戶後回傳簽名預覽；不建立Meta容器或發布。
 - POST /publish：開關啟用、同源、密鑰、明確approved=true及十分鐘內有效簽名預覽才處理。確認綁定帳戶與原文，不能預覽A卻改送B。
 - Meta流程：建立TEXT容器、輪詢FINISHED、發布容器、讀permalink。任何發送結果不明不自動再發；連結查詢失敗也不重發。
-- 不支援排程、圖片、串文或長文附件；600字故事不可直接送單帖。程式是否開啟不是Meta授予權限的證據，首次實測仍可被Meta拒絕。
+- 支援500字內主帖及可選10,000單位內長文附文，可保留600字故事全文；不支援排程、圖片或串文。程式是否開啟不是Meta授予權限的證據，首次實測仍可被Meta拒絕。
 
 ## Render設定
 程式檔server.py及publisher.html必須放在同一目錄。Runtime Python3，Branch main，Root Directory `integrations/threads-bridge`，Build `python -m compileall -q server.py`，Start `python server.py`，Health `/health`，免費方案可先測。
@@ -41,10 +41,32 @@ SQLite以帳戶+文字hash作唯一鍵。併發或同文再送不重發；結果
 此頁面是由使用者以自己持有的密鑰操作。Codex仍未自動取得主機秘密或發布工具，不等於聊天可直接代發。往後需安全工具連接，而不是把BRIDGE_API_KEY貼入對話。
 
 ## 檢查
-`python -m unittest discover -s integrations/threads-bridge -p 'test_*.py' -v`（repo根目錄）。13項離線測試，Meta被mock，沒有用真實Token。
+`python -m unittest discover -s integrations/threads-bridge -p 'test_*.py' -v`（repo根目錄）。20項離線測試，Meta被mock，沒有用真實Token。
 已涵蓋預設禁止發布、明確批准、預覽綁定與過期、帳戶變動、超長文字、同文與併發去重、結果不明、容器失敗、連結失敗不重發、HTTP認證與來源、上游錯誤不回傳密鑰。
 
 官方參考（2026-10-20本輪讀取）：
 - https://developers.facebook.com/documentation/threads/posts/ ：兩階段發布及500字單帖限制。
 - https://developers.facebook.com/docs/threads/retrieve-and-discover-posts/retrieve-posts/ ：permalink。
 - 目前已通過讀帳戶的graph.threads.net/v1.0沿用；若Meta調整API，需核對官方及實際錯誤，不能假裝已測試發帖。
+
+## Chat批准後直接發布（第二階段）
+
+正式流程不要求使用者逐篇開本頁：Manager在Chat交付主帖、長文附文、帳戶及版本，使用者批准後，Manager才建立一個新的approved-threads/*.json工作檔並提交main。GitHub自動工作執行scripts/publish_chat_approved.py，讀取runner秘密呼叫Render預覽並核對完全一致後發布，回傳receipt及永久GitHub deployment嘗試紀錄。
+
+### 一次性設定（尚待完成及端到端驗證）
+1. Repository Settings → Secrets and variables → Actions，新增Repository secret `THREADS_BRIDGE_API_KEY`，值是Render既有BRIDGE_API_KEY。不是Threads Token，不把值送到Chat。現有Codex連接無權替使用者讀取或設定此管理項目。
+2. GitHub須有.github/workflows/publish-chat-approved.yml，Actions允許執行；程式指定contents:read與deployments:write，不能改成只讀deployments。
+3. Render部署此版，保留THREADS_ACCESS_TOKEN、BRIDGE_API_KEY、THREADS_EXPECTED_USERNAME、PUBLIC_ORIGIN；測試指定版本準備好後一次性設PUBLISH_ENABLED=true，之後每篇由Chat批准工作檔控制，不再逐篇改開關。
+4. 第一個Chat已批准短文工作檔跑完後，核對實際Threads內容及回傳；未成功前不稱整條鏈已接通。600字可用主帖+長文附文，附文原封保留全文，先在Chat顯示形式及全文才批准。
+
+### 永久去重與執行回傳
+GitHub workflow只處理一次commit新增的一個已批准工作檔，全部發布任務串行；修改舊檔不觸發新發布。以帳戶、主帖與附文的hash建立唯一environment對應的deployment嘗試紀錄，發送前建立；即使Render重啟，舊嘗試仍擋重送。任何結果不明先停，不自動重發。GitHub紀錄也可能由管理者刪除，故仍須保留receipt及核對真實貼文，並非不可遺失的保證。
+
+工作結果保存在Actions artifact `threads-publication-receipt`（90日）及deployment狀態；Manager取得後寫回內容總表。提交工作檔不等於已發布，排隊／成功／不明分開。沒有Actions授權或secret時會停，不公開秘密也不降級為無認證端點。
+
+**此repo公開，approved-threads工作檔中的已批准主帖及附文也會成為公開repository內容。** 未經批准的草稿不得提交該目錄；若使用者不接受這種持久公開紀錄，須先改用私人repository／私人佇列再啟用，不能假稱GitHub是私人傳輸。
+
+### 工作檔格式（不要直接用這段當批准內容）
+schema=1、approved=true、account、approval_ref（固定作品及版本）、approved_at（Unix秒，24小時內）、text（主帖）、attachment（可空，長文全文）、sha256。sha256以scripts/publish_chat_approved.py的fingerprint計算，需精確匹配Chat已批准版本。不得因排程到點或一般「好」而自行新增工作檔；本次功能設定同意不是測試貼文批准。
+
+20項離線測試已通過，涵蓋長文與Chat交接、跨主機重啟的外部嘗試紀錄、完整版本比對及不明結果停送。尚未以真實貼文驗證API、GitHub Actions及主機全部權限。
