@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-Hant"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Threads 發布預覽</title>
+<style>body{max-width:760px;margin:30px auto;padding:0 20px;font:17px/1.7 system-ui;color:#223;background:#f6f8fc}input,textarea,button{box-sizing:border-box;font:inherit;padding:10px;margin:6px 0}input,textarea{width:100%}button{cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#fff;padding:15px}label{display:block}#approved{width:auto}.note{background:#fff2cc;padding:14px}button:disabled{cursor:default;opacity:.5}</style>
+<h1>Threads 發布預覽</h1>
+<p>先核對帳戶及全文，再明確確認。本頁沒有自動排程，也不會自動發帖。</p>
+<p class="note">第一版只支援500字內單篇文字（含標點，emoji採保守計數）。600字故事先不要直接貼入。免費主機的防重複紀錄可能在重啟／重新部署後消失；結果不明時，先到Threads確認，切勿連按重試。</p>
+<label>服務密鑰 BRIDGE_API_KEY<input id="key" type="password" autocomplete="off" spellcheck="false"></label>
+<button id="check">核對帳戶</button><button id="history">查看本服務發布紀錄</button>
+<label>準備發布的文字<textarea id="text" rows="8" placeholder="貼上你已審閱的短文；預覽不會發帖。"></textarea></label>
+<button id="preview">產生預覽（不發布）</button>
+<h2>預覽</h2><pre id="account">尚未核對帳戶</pre><pre id="copy">尚未產生預覽</pre>
+<label><input id="approved" type="checkbox" disabled>我已確認上方帳戶與完整文字，同意現在公開發布這一篇。</label>
+<button id="publish" disabled>確認立即公開發布</button>
+<pre id="result" role="status"></pre>
+<script nonce="__NONCE__">
+(() => {
+  const el = id => document.getElementById(id);
+  let ticket = null, busy = false;
+  function reset() { ticket = null; el('approved').checked = false; el('approved').disabled = true; el('publish').disabled = true; el('copy').textContent = '內容或密鑰已改動，請重新預覽。'; }
+  function show(data) { el('result').textContent = JSON.stringify(data, null, 2); }
+  async function api(path, body) {
+    const key = el('key').value.trim();
+    if (!key) throw new Error('請輸入Render裡的BRIDGE_API_KEY，不是Threads Token。');
+    const headers = { Authorization: 'Bearer ' + key };
+    const options = { method: body === undefined ? 'GET' : 'POST', headers, cache: 'no-store', credentials: 'omit' };
+    if (body !== undefined) { headers['Content-Type'] = 'application/json'; options.body = JSON.stringify(body); }
+    const response = await fetch(path, options);
+    let data;
+    try { data = await response.json(); } catch { throw new Error('服務未回傳JSON；可能正在喚醒，請先檢查/health。若已按發布，先到Threads核對結果。'); }
+    if (!response.ok) throw new Error(JSON.stringify(data));
+    return data;
+  }
+  el('key').addEventListener('input', reset);
+  el('text').addEventListener('input', reset);
+  el('approved').addEventListener('change', () => { el('publish').disabled = busy || !ticket || !el('approved').checked; });
+  el('check').onclick = async () => {
+    try { const data = await api('/account'); el('account').textContent = JSON.stringify(data, null, 2); show({message:'帳戶讀取成功；這一步沒有發布貼文。'}); }
+    catch(error) { show({error:error.message}); }
+  };
+  el('history').onclick = async () => { try { show(await api('/history')); } catch(error) { show({error:error.message}); } };
+  el('preview').onclick = async () => {
+    if (busy) return;
+    reset();
+    try {
+      const data = await api('/preview', {text:el('text').value});
+      ticket = data.ticket;
+      el('account').textContent = '@' + data.account.username + '\n帳戶編號：' + data.account.id;
+      el('copy').textContent = data.text;
+      el('approved').disabled = !data.account.publishing_enabled;
+      show({message:data.account.publishing_enabled ? '請逐字核對，再勾選確認。預覽十分鐘後過期。' : '預覽完成；主機發布開關仍關閉，不會發帖。', counted_units:data.counted_units});
+    } catch(error) { show({error:error.message}); }
+  };
+  el('publish').onclick = async () => {
+    if (busy || !ticket || !el('approved').checked) return;
+    if (!confirm('確認把預覽中的這篇文字，立即公開發布到上方Threads帳戶？')) return;
+    busy = true;
+    const approvedTicket = ticket;
+    ticket = null;
+    el('publish').disabled = true; el('preview').disabled = true;
+    el('approved').disabled = true; el('text').disabled = true; el('key').disabled = true;
+    show({message:'正在處理；請勿關閉頁面或重複提交。'});
+    try { show(await api('/publish', {ticket:approvedTicket, approved:true})); }
+    catch(error) { show({error:error.message, next:'不要重新發布。請先到Threads及本服務紀錄核對，結果可能已成功。'}); }
+    finally { busy = false; el('preview').disabled = false; el('text').disabled = false; el('key').disabled = false; el('approved').checked = false; }
+  };
+})();
+</script></html>
