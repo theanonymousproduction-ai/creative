@@ -1,0 +1,48 @@
+name: Check Threads connection without publishing
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/check-threads-connection.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify account using read-only endpoint
+        env:
+          THREADS_BRIDGE_API_KEY: ${{ secrets.THREADS_BRIDGE_API_KEY }}
+        run: |
+          python3 - <<'PYCODE'
+          import sys, os, json
+          from pathlib import Path
+          sys.path.insert(0, str(Path('scripts').resolve()))
+          import publish_chat_approved as worker
+          secret = os.environ.get('THREADS_BRIDGE_API_KEY', '').strip()
+          if not secret:
+              raise SystemExit('Connection secret missing')
+          try:
+              account = worker.bridge('/account', secret)
+          except worker.Stop as exc:
+              raise SystemExit(str(exc)) from None
+          if account.get('username') != worker.EXPECTED_ACCOUNT:
+              raise SystemExit('Account username does not match configured account')
+          if str(account.get('id')) != '27025518633755187':
+              raise SystemExit('Account numeric ID does not match original account')
+          if account.get('publishing_enabled') is not True:
+              raise SystemExit('Publishing switch is off')
+          result = {'verified': True, 'username': account['username'],
+                    'id': str(account['id']), 'publishing_enabled': True,
+                    'post_sent': False}
+          Path('connection-check.json').write_text(json.dumps(result))
+          print(json.dumps(result))
+          PYCODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: threads-connection-check
+          path: connection-check.json
