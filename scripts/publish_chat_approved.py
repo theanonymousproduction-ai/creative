@@ -13,7 +13,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 BRIDGE = 'https://creative-hl3h.onrender.com'
-EXPECTED_ACCOUNT = 'wannasaybutdidnt'
+EXPECTED_ACCOUNT = 'luen.dayori'
 ROOT = Path(__file__).resolve().parents[1]
 
 
