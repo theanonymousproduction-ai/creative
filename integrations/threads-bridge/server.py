@@ -122,16 +122,23 @@ def read_ticket(ticket):
     return payload
 
 
+def reply_target(value):
+    if value is not None and (not isinstance(value, str) or not value.isdigit()):
+        raise Problem(400, "invalid_reply_target")
+    return value
+
+
 def preview(body):
     text, units = validate_text(body.get('text'))
     attachment = body.get('attachment', '')
     if not isinstance(attachment, str):
         raise Problem(400, 'invalid_attachment')
     attachment = validate_text(attachment, limit=10000)[0] if attachment.strip() else ''
+    target = reply_target(body.get('reply_to_id'))
     user = check_account()
     payload = {'account_id': user['id'], 'username': user['username'], 'text': text,
-               'attachment': attachment, 'expires': int(time.time()) + 600, 'ticket_id': secrets.token_hex(16)}
-    return {'account': user, 'text': text, 'attachment': attachment, 'counted_units': units,
+               'reply_to_id': target, 'attachment': attachment, 'expires': int(time.time()) + 600, 'ticket_id': secrets.token_hex(16)}
+    return {'account': user, 'text': text, 'attachment': attachment, 'reply_to_id': target, 'counted_units': units,
             'ticket': signed_ticket(payload), 'expires_in_seconds': 600}
 
 
@@ -167,7 +174,8 @@ def publish(body):
     user = check_account()
     if payload.get('account_id') != user['id'] or payload.get('username') != user['username']:
         raise Problem(409, 'account_changed_since_preview')
-    digest = hashlib.sha256((user['id'] + '\0' + text + ('\0attachment\0' + attachment if attachment else '')).encode()).hexdigest()
+    target = reply_target(payload.get('reply_to_id'))
+    digest = hashlib.sha256((user['id'] + '\0' + text + ('\0attachment\0' + attachment if attachment else '') + ('\0reply\0' + target if target else '')).encode()).hexdigest()
     conn = database()
     try:
         conn.execute('BEGIN IMMEDIATE')
@@ -187,6 +195,8 @@ def publish(body):
         form = {'media_type': 'TEXT', 'text': text}
         if attachment:
             form['text_attachment'] = json.dumps({'plaintext': attachment}, ensure_ascii=False)
+        if target:
+            form['reply_to_id'] = target
         container = meta('/' + user['id'] + '/threads', form)
         cid = str(container.get('id', ''))
         if not cid.isdigit():
@@ -255,7 +265,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             if self.path == '/health':
-                return self.respond(200, {'ok': True, 'version': 'chat-approval-v2'})
+                return self.respond(200, {'ok': True, 'version': 'chat-replies-v3'})
             if self.path == '/':
                 nonce = secrets.token_urlsafe(24)
                 page = (ROOT / 'publisher.html').read_text().replace('__NONCE__', nonce)
