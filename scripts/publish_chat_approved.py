@@ -21,8 +21,10 @@ class Stop(Exception):
     pass
 
 
-def fingerprint(account, text, attachment=''):
+def fingerprint(account, text, attachment='', reply_to_id=None):
     data = {'account': account, 'text': text, 'attachment': attachment}
+    if reply_to_id is not None:
+        data['reply_to_id'] = reply_to_id
     return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True,
                                     separators=(',', ':')).encode()).hexdigest()
 
@@ -49,7 +51,10 @@ def validate(job):
             raise Stop('invalid_approval_text') from None
     if not text:
         raise Stop('empty_post')
-    digest = fingerprint(EXPECTED_ACCOUNT, text, attachment)
+    target = job.get('reply_to_id')
+    if target is not None and (not isinstance(target, str) or not target.isdigit()):
+        raise Stop('invalid_reply_target')
+    digest = fingerprint(EXPECTED_ACCOUNT, text, attachment, target)
     if job.get('sha256') != digest:
         raise Stop('approval_digest_mismatch')
     return digest
@@ -94,8 +99,9 @@ def process(job):
     user = bridge('/account', secret)
     if user.get('username') != EXPECTED_ACCOUNT or user.get('publishing_enabled') is not True:
         raise Stop('wrong_account_or_publishing_switch_off')
-    snapshot = bridge('/preview', secret, {'text': job['text'], 'attachment': job.get('attachment', '')})
-    if (snapshot.get('text') != job['text'] or
+    snapshot = bridge('/preview', secret, {'text': job['text'], 'attachment': job.get('attachment', ''), 'reply_to_id': job.get('reply_to_id')})
+    if (snapshot.get('reply_to_id') != job.get('reply_to_id') or
+        snapshot.get('text') != job['text'] or
         snapshot.get('attachment', '') != job.get('attachment', '') or
         snapshot.get('account', {}).get('id') != user.get('id') or
         snapshot.get('account', {}).get('username') != EXPECTED_ACCOUNT or
