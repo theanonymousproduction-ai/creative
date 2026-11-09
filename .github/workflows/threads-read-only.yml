@@ -1,0 +1,43 @@
+name: Read-only Threads discovery
+on:
+  push:
+    branches: [main]
+    paths: ['threads-read-requests/*.json']
+permissions:
+  contents: read
+concurrency:
+  group: threads-read-only
+  cancel-in-progress: false
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      THREADS_BRIDGE_API_KEY: ${{ secrets.THREADS_BRIDGE_API_KEY }}
+      BEFORE_SHA: ${{ github.event.before }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Execute only one newly added read-only request
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess, sys
+          before, current = os.environ['BEFORE_SHA'], os.environ['GITHUB_SHA']
+          if not re.fullmatch(r'[0-9a-f]{40}', before) or before == '0' * 40:
+              raise SystemExit('Cannot establish request commit range')
+          result = subprocess.check_output(['git', 'diff', '--name-status', '--diff-filter=A', before, current, '--', 'threads-read-requests/*.json'], text=True)
+          paths = [line.split('\t', 1)[1] for line in result.splitlines() if line.startswith('A\t')]
+          if len(paths) != 1:
+              raise SystemExit('Require exactly one new read-only job')
+          subprocess.run([sys.executable, 'scripts/read_threads.py', *paths], check=True)
+          PY
+      - name: Save read-only result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: threads-read-only-result
+          path: threads-read-result.json
+          if-no-files-found: ignore
+          retention-days: 7

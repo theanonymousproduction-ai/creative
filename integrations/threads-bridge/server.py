@@ -12,7 +12,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 API = 'https://graph.threads.net/v1.0'
@@ -61,7 +61,15 @@ def meta(path, form=None):
         return result
     except HTTPError as exc:
         # Never echo raw upstream errors, request URLs or credentials.
-        raise Problem(502, 'meta_request_failed', upstream_status=exc.code) from None
+        details = {'upstream_status': exc.code}
+        try:
+            error = json.loads(exc.read(32768)).get('error', {})
+            for source, target in [('code', 'upstream_code'), ('error_subcode', 'upstream_subcode')]:
+                if type(error.get(source)) is int:
+                    details[target] = error[source]
+        except (ValueError, AttributeError, OSError):
+            pass
+        raise Problem(502, 'meta_request_failed', **details) from None
     except (URLError, TimeoutError, ValueError):
         raise Problem(502, 'meta_connection_failed') from None
 
@@ -126,6 +134,67 @@ def reply_target(value):
     if value is not None and (not isinstance(value, str) or not value.isdigit()):
         raise Problem(400, "invalid_reply_target")
     return value
+
+
+READ_FIELDS = ('id', 'text', 'username', 'permalink', 'timestamp', 'media_type')
+
+
+def read_threads(params):
+    """Bounded GET-only discovery. Never follow upstream paging URLs containing tokens."""
+    if not isinstance(params, dict) or any(not isinstance(v, str) for v in params.values()):
+        raise Problem(400, 'invalid_read_parameters')
+    operation = params.get('operation')
+    allowed = {'search': {'operation', 'q', 'limit', 'search_type'},
+               'post': {'operation', 'post_id'},
+               'replies': {'operation', 'post_id', 'limit'},
+               'own_posts': {'operation', 'limit'}}
+    if operation not in allowed or set(params) - allowed[operation]:
+        raise Problem(400, 'invalid_read_operation')
+    count = params.get('limit', '5')
+    if len(count) > 2 or not count.isascii() or not count.isdigit() or not 1 <= int(count) <= 20:
+        raise Problem(400, 'invalid_read_limit')
+    query = {'fields': ','.join(READ_FIELDS)}
+    if operation != 'post':
+        query['limit'] = int(count)
+    if operation == 'search':
+        term = params.get('q', '')
+        ordering = params.get('search_type', 'RECENT')
+        if not term.strip() or len(term) > 80 or any(ord(c) < 32 for c in term):
+            raise Problem(400, 'invalid_search_query')
+        if ordering not in ('TOP', 'RECENT'):
+            raise Problem(400, 'invalid_search_type')
+        query.update(q=term, search_type=ordering)
+        endpoint = '/keyword_search'
+    elif operation == 'own_posts':
+        endpoint = '/me/threads'
+    else:
+        post_id = reply_target(params.get('post_id'))
+        if post_id is None or not post_id.isascii() or len(post_id) > 40:
+            raise Problem(400, 'invalid_read_post_id')
+        endpoint = '/' + post_id + ('/replies' if operation == 'replies' else '')
+    user = check_account()
+    result = meta(endpoint + '?' + urlencode(query))
+    rows = [result] if operation == 'post' else result.get('data')
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise Problem(502, 'unexpected_meta_read_response')
+    data = []
+    for row in rows[:int(count)]:
+        item = {key: row[key] for key in READ_FIELDS if isinstance(row.get(key), str)}
+        if not item.get('id', '').isascii() or not item.get('id', '').isdigit():
+            raise Problem(502, 'unexpected_meta_post_id')
+        try:
+            link = urlsplit(item.get('permalink', ''))
+            valid_link = link.scheme == 'https' and link.hostname in ('threads.com', 'www.threads.com', 'threads.net', 'www.threads.net') and not link.username and not link.password
+        except ValueError:
+            valid_link = False
+        if not valid_link:
+            item.pop('permalink', None)
+        data.append(item)
+    return {'account': user, 'operation': operation, 'data': data,
+            'has_more': bool(result.get('paging', {}).get('next')) if isinstance(result.get('paging'), dict) else False,
+            'public_discovery_verified': operation == 'search' and any(
+                item.get('username') and item['username'].casefold() != user['username'].casefold()
+                for item in data)}
 
 
 def preview(body):
@@ -265,12 +334,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             if self.path == '/health':
-                return self.respond(200, {'ok': True, 'version': 'chat-replies-v3'})
+                return self.respond(200, {'ok': True, 'version': 'discovery-read-v4'})
             if self.path == '/':
                 nonce = secrets.token_urlsafe(24)
                 page = (ROOT / 'publisher.html').read_text().replace('__NONCE__', nonce)
                 return self.respond(200, page, 'text/html; charset=utf-8', nonce)
             self.authorized()
+            parsed = urlsplit(self.path)
+            if parsed.path == '/read':
+                params = parse_qs(parsed.query, keep_blank_values=True)
+                if any(len(values) != 1 for values in params.values()):
+                    raise Problem(400, 'duplicate_read_parameter')
+                return self.respond(200, read_threads({k: v[0] for k, v in params.items()}))
             if self.path == '/account':
                 return self.respond(200, account())
             if self.path == '/history':
