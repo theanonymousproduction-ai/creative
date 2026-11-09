@@ -52,6 +52,16 @@ def process(job):
     secret = os.environ.get('THREADS_BRIDGE_API_KEY', '').strip()
     if not secret:
         raise ReadError('bridge_secret_missing')
+    health = Request(BRIDGE + '/health', headers={'Accept': 'application/json', 'Cache-Control': 'no-cache'})
+    try:
+        with urlopen(health, timeout=100) as response:
+            version = json.load(response).get('version')
+        if version != 'discovery-read-v4':
+            return {'state': 'blocked', 'error': 'bridge_upgrade_required',
+                    'expected_version': 'discovery-read-v4',
+                    'observed_version': version if version in ('chat-replies-v3', 'preview-publish-v1') else 'unknown'}
+    except (HTTPError, URLError, TimeoutError, ValueError, AttributeError):
+        return {'state': 'blocked', 'error': 'bridge_health_check_failed'}
     request = Request(BRIDGE + '/read?' + urlencode(params), headers={
         'Authorization': 'Bearer ' + secret, 'Accept': 'application/json',
         'User-Agent': 'luen-dayori-read-only'})
@@ -62,6 +72,8 @@ def process(job):
         safe = {'error': 'bridge_request_rejected', 'http_status': exc.code}
         try:
             body = json.loads(exc.read(32768))
+            if body.get('error') in ('not_found', 'unauthorized', 'account_mismatch', 'meta_request_failed', 'meta_connection_failed', 'threads_token_not_configured'):
+                safe['bridge_error'] = body['error']
             # Only numeric upstream diagnostics; never relay raw messages or headers.
             for key in ('upstream_status', 'upstream_code', 'upstream_subcode'):
                 if type(body.get(key)) is int:

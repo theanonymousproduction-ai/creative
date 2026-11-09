@@ -102,9 +102,20 @@ class DiscoveryTests(unittest.TestCase):
         def get(req, timeout):
             self.assertEqual(req.get_method(), 'GET')
             self.assertEqual(urlsplit(req.full_url).hostname, 'creative-hl3h.onrender.com')
+            if urlsplit(req.full_url).path == '/health':
+                return Response(json.dumps({'version': 'discovery-read-v4'}).encode())
             return Response(json.dumps({'account': {'username': 'wrong'}, 'data': []}).encode())
         with patch.object(runner, 'urlopen', side_effect=get):
             with self.assertRaises(runner.ReadError): runner.process({'schema': 1, 'account': 'luen.dayori', 'operation': 'own_posts'})
+
+    def test_runner_reports_old_deployment_before_search(self):
+        class Response(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *_): self.close()
+        with patch.object(runner, 'urlopen', return_value=Response(b'{"version":"chat-replies-v3"}')) as http:
+            result = runner.process({'schema': 1, 'account': 'luen.dayori', 'operation': 'own_posts'})
+        self.assertEqual(result['error'], 'bridge_upgrade_required')
+        self.assertEqual(http.call_count, 1)
 
 
 if __name__ == '__main__':

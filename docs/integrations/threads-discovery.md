@@ -10,3 +10,5 @@ Meta權限與限制：搜尋需要threads_keyword_search；公開陌生帳戶搜
 官方端點例：https://www.postman.com/meta/threads/request/34203612-b3b2c12a-7ce6-4d86-a3c6-6d31e3b66ea1
 Meta範例庫權限說明：https://github.com/fbsamples/threads_api/issues/72 （Contributor對Advanced Access與僅本人搜尋的說明；非Token狀態證據）。官方主文件讀取429，使用官方Postman端點及範例庫討論有限核對，不宣稱已讀受阻頁。
 30項離線測試通過，實際Render部署及Meta搜尋權限待唯讀測試，不包含發帖或自動互動測試。
+
+本輪實測紀錄：程式main a79204698b36da6c1662142ce34cb1d01d91f4b6，唯讀請求471820ac2308ce3b6b3a088017af5f46336bdda0，Actions run42597265174，job129092857719，回HTTP404。曾有一次/health回discovery-read-v4，其後兩次仍chat-replies-v3；未有穩定新版部署回執，不能當接通。新增runner版本檢查，舊部署先回bridge_upgrade_required，避免把路由404誤報成Meta權限不足。31項離線測試通過，待新版實際部署。
