@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -197,6 +198,18 @@ def read_threads(params):
                 for item in data)}
 
 
+def explicit_repost(value):
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or set(value) != {'original_post_id', 'original_deployment_id', 'authorization_ref', 'user_confirmed_deleted'}
+            or value['user_confirmed_deleted'] is not True
+            or type(value['original_deployment_id']) is not int or value['original_deployment_id'] <= 0
+            or not isinstance(value['original_post_id'], str) or not re.fullmatch(r'[0-9]{1,40}', value['original_post_id'])
+            or not isinstance(value['authorization_ref'], str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', value['authorization_ref'])):
+        raise Problem(400, 'invalid_explicit_repost_authorization')
+    return value
+
+
 def preview(body):
     text, units = validate_text(body.get('text'))
     attachment = body.get('attachment', '')
@@ -204,10 +217,15 @@ def preview(body):
         raise Problem(400, 'invalid_attachment')
     attachment = validate_text(attachment, limit=10000)[0] if attachment.strip() else ''
     target = reply_target(body.get('reply_to_id'))
+    repost = explicit_repost(body.get('repost'))
+    if repost is not None and target is not None:
+        raise Problem(400, 'repost_only_for_new_main_post')
     user = check_account()
     payload = {'account_id': user['id'], 'username': user['username'], 'text': text,
                'reply_to_id': target, 'attachment': attachment, 'expires': int(time.time()) + 600, 'ticket_id': secrets.token_hex(16)}
-    return {'account': user, 'text': text, 'attachment': attachment, 'reply_to_id': target, 'counted_units': units,
+    if repost is not None:
+        payload['repost'] = repost
+    return {'account': user, 'text': text, 'attachment': attachment, 'reply_to_id': target, 'repost': repost, 'counted_units': units,
             'ticket': signed_ticket(payload), 'expires_in_seconds': 600}
 
 
@@ -244,7 +262,10 @@ def publish(body):
     if payload.get('account_id') != user['id'] or payload.get('username') != user['username']:
         raise Problem(409, 'account_changed_since_preview')
     target = reply_target(payload.get('reply_to_id'))
-    digest = hashlib.sha256((user['id'] + '\0' + text + ('\0attachment\0' + attachment if attachment else '') + ('\0reply\0' + target if target else '')).encode()).hexdigest()
+    repost = explicit_repost(payload.get('repost'))
+    if repost is not None and target is not None:
+        raise Problem(400, 'repost_only_for_new_main_post')
+    digest = hashlib.sha256((user['id'] + '\0' + text + ('\0attachment\0' + attachment if attachment else '') + ('\0reply\0' + target if target else '') + ('\0explicit-repost\0' + json.dumps(repost, sort_keys=True, separators=(',', ':')) if repost is not None else '')).encode()).hexdigest()
     conn = database()
     try:
         conn.execute('BEGIN IMMEDIATE')
@@ -334,7 +355,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             if self.path == '/health':
-                return self.respond(200, {'ok': True, 'version': 'discovery-read-v4'})
+                return self.respond(200, {'ok': True, 'version': 'explicit-repost-v5'})
             if self.path == '/':
                 nonce = secrets.token_urlsafe(24)
                 page = (ROOT / 'publisher.html').read_text().replace('__NONCE__', nonce)

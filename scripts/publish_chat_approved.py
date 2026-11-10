@@ -21,12 +21,26 @@ class Stop(Exception):
     pass
 
 
-def fingerprint(account, text, attachment='', reply_to_id=None):
+def fingerprint(account, text, attachment='', reply_to_id=None, repost=None):
     data = {'account': account, 'text': text, 'attachment': attachment}
     if reply_to_id is not None:
         data['reply_to_id'] = reply_to_id
+    if repost is not None:
+        data['repost'] = repost
     return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True,
                                     separators=(',', ':')).encode()).hexdigest()
+
+
+def validate_repost(value):
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or set(value) != {'original_post_id', 'original_deployment_id', 'authorization_ref', 'user_confirmed_deleted'}
+            or value['user_confirmed_deleted'] is not True
+            or type(value['original_deployment_id']) is not int or value['original_deployment_id'] <= 0
+            or not isinstance(value['original_post_id'], str) or not re.fullmatch(r'[0-9]{1,40}', value['original_post_id'])
+            or not isinstance(value['authorization_ref'], str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', value['authorization_ref'])):
+        raise Stop('invalid_explicit_repost_authorization')
+    return value
 
 
 def validate(job):
@@ -54,7 +68,10 @@ def validate(job):
     target = job.get('reply_to_id')
     if target is not None and (not isinstance(target, str) or not target.isdigit()):
         raise Stop('invalid_reply_target')
-    digest = fingerprint(EXPECTED_ACCOUNT, text, attachment, target)
+    repost = validate_repost(job.get('repost'))
+    if repost is not None and target is not None:
+        raise Stop('repost_only_for_new_main_post')
+    digest = fingerprint(EXPECTED_ACCOUNT, text, attachment, target, repost)
     if job.get('sha256') != digest:
         raise Stop('approval_digest_mismatch')
     return digest
@@ -99,8 +116,22 @@ def process(job):
     user = bridge('/account', secret)
     if user.get('username') != EXPECTED_ACCOUNT or user.get('publishing_enabled') is not True:
         raise Stop('wrong_account_or_publishing_switch_off')
-    snapshot = bridge('/preview', secret, {'text': job['text'], 'attachment': job.get('attachment', ''), 'reply_to_id': job.get('reply_to_id')})
-    if (snapshot.get('reply_to_id') != job.get('reply_to_id') or
+    repost = job.get('repost')
+    request = {'text': job['text'], 'attachment': job.get('attachment', ''), 'reply_to_id': job.get('reply_to_id')}
+    if repost is not None:
+        old = github('/deployments/' + str(repost['original_deployment_id']), gh_token)
+        old_digest = fingerprint(EXPECTED_ACCOUNT, job['text'], job.get('attachment', ''))
+        if (old.get('environment') != 'threads-' + old_digest
+                or old.get('payload', {}).get('sha256') != old_digest
+                or old.get('payload', {}).get('account') != EXPECTED_ACCOUNT):
+            raise Stop('repost_original_content_or_account_mismatch')
+        statuses = github('/deployments/' + str(repost['original_deployment_id']) + '/statuses?per_page=1', gh_token)
+        if (not isinstance(statuses, list) or not statuses or statuses[0].get('state') != 'success'
+                or statuses[0].get('description') != 'Threads post ' + repost['original_post_id']):
+            raise Stop('repost_original_publication_not_confirmed')
+        request['repost'] = repost
+    snapshot = bridge('/preview', secret, request)
+    if (snapshot.get('repost') != repost or snapshot.get('reply_to_id') != job.get('reply_to_id') or
         snapshot.get('text') != job['text'] or
         snapshot.get('attachment', '') != job.get('attachment', '') or
         snapshot.get('account', {}).get('id') != user.get('id') or
@@ -122,12 +153,15 @@ def process(job):
         'environment': environment, 'transient_environment': False,
         'production_environment': True,
         'description': 'Chat-approved Threads ' + job['approval_ref'],
-        'payload': {'sha256': digest, 'approval_ref': job['approval_ref'], 'account': EXPECTED_ACCOUNT}})
+        'payload': {'sha256': digest, 'approval_ref': job['approval_ref'], 'account': EXPECTED_ACCOUNT,
+                    **({'repost': repost} if repost is not None else {})}})
     if not isinstance(claim.get('id'), int):
         raise Stop('durable_ledger_claim_failed')
     result = {'approval_ref': job['approval_ref'], 'sha256': digest,
               'account': EXPECTED_ACCOUNT, 'deployment_id': claim['id'],
               'state': 'uncertain', 'post_id': None, 'permalink': None}
+    if repost is not None:
+        result['repost'] = repost
     try:
         published = bridge('/publish', secret, {'ticket': snapshot['ticket'], 'approved': True})
         if published.get('state') != 'published' or not str(published.get('post_id', '')).isdigit():
