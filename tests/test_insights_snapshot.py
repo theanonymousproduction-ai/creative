@@ -18,4 +18,5 @@ class Tests(unittest.TestCase):
   original=m.process
   with patch.object(m,'process',return_value={'state':'blocked'}) as f:r=original(job)
   self.assertEqual(f.call_count,1);self.assertEqual(r['state'],'blocked');self.assertEqual(len(r['post_results']),1)
-unittest.main()
+if __name__ == '__main__':
+ unittest.main()
