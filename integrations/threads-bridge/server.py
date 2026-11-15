@@ -19,6 +19,7 @@ from urllib.request import Request, urlopen
 
 API = 'https://graph.threads.net/v1.0'
 ROOT = Path(__file__).resolve().parent
+import threads_oauth
 
 
 class Problem(Exception):
@@ -390,7 +391,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
-    def respond(self, status, data, content_type='application/json; charset=utf-8', nonce=None):
+    def respond(self, status, data, content_type='application/json; charset=utf-8', nonce=None, extra_headers=None):
         payload = (data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)).encode()
         self.send_response(status)
         self.send_header('Content-Type', content_type)
@@ -400,6 +401,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Frame-Options', 'DENY')
         if nonce:
             self.send_header('Content-Security-Policy', "default-src 'none'; script-src 'nonce-" + nonce + "'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+        for key,value in (extra_headers or {}).items():
+            self.send_header(key,value)
         self.send_header('Content-Length', str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -411,8 +414,32 @@ class Handler(BaseHTTPRequestHandler):
         if not hmac.compare_digest(self.headers.get('Authorization', '').encode(), ('Bearer ' + key).encode()):
             raise Problem(401, 'unauthorized')
 
+    def oauth_get(self, parsed):
+        headers={'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"}
+        try:
+            if parsed.path == '/oauth/threads':
+                text='<h1>Threads 搜尋授權</h1><p>此流程只核對 luen.dayori、測試唯讀搜尋及取得新 Token，不發布貼文或留言。現用 Token 不會自動更改。</p>'
+                text+=('<p><a href="/oauth/threads/start">開始重新授權</a></p>' if threads_oauth.ready() else '<p>尚待在 Render 設定 THREADS_APP_SECRET。不要將密鑰交給 Chat。</p>')
+                return self.respond(200,threads_oauth.page(text),'text/html; charset=utf-8',extra_headers=headers)
+            if parsed.path == '/oauth/threads/start':
+                location,cookie=threads_oauth.start();headers.update({'Location':location,'Set-Cookie':cookie})
+                return self.respond(302,'','text/html; charset=utf-8',extra_headers=headers)
+            if parsed.path == '/oauth/threads/callback':
+                params=parse_qs(parsed.query,keep_blank_values=True)
+                result=threads_oauth.complete(params,self.headers.get('Cookie',''))
+                headers['Set-Cookie']=threads_oauth.COOKIE+'=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0'
+                return self.respond(200,result,'text/html; charset=utf-8',extra_headers=headers)
+            return self.respond(404,{'error':'not_found'})
+        except threads_oauth.OAuthError as exc:
+            messages={'setup_required':'請先在 Render 設定 THREADS_APP_SECRET。','invalid_state':'授權已逾時或瀏覽器驗證不符，請從授權入口重新開始。','account_mismatch':'帳戶並非預期的 luen.dayori，現用 Token 未更改。','authorization_declined':'授權未完成，現用 Token 未更改。'}
+            message=messages.get(str(exc),'新授權的讀取／搜尋測試未通過，或 Token 交換失敗。現用 Token 未更改；請統籌核對權限或審查要求。')
+            return self.respond(400,threads_oauth.page('<h1>授權未完成</h1><p>'+message+'</p><a href="/oauth/threads">返回授權入口</a>'),'text/html; charset=utf-8',extra_headers=headers)
+
     def do_GET(self):
         try:
+            parsed = urlsplit(self.path)
+            if parsed.path.startswith('/oauth/threads'):
+                return self.oauth_get(parsed)
             if self.path == '/health':
                 return self.respond(200, {'ok': True, 'version': 'insights-read-v6', 'read_operations': ['search', 'post', 'replies', 'own_posts', 'post_insights', 'account_insights']})
             if self.path == '/':
