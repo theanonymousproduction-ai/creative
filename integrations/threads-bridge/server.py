@@ -5,6 +5,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -140,11 +141,69 @@ def reply_target(value):
 READ_FIELDS = ('id', 'text', 'username', 'permalink', 'timestamp', 'media_type')
 
 
+def read_insights(params):
+    operation = params.get('operation')
+    allowed = {'operation', 'post_id'} if operation == 'post_insights' else {'operation'}
+    if set(params) - allowed:
+        raise Problem(400, 'invalid_read_parameters')
+    user = check_account()
+    if operation == 'post_insights':
+        target = params.get('post_id')
+        if not isinstance(target, str) or not re.fullmatch(r'[0-9]{1,40}', target):
+            raise Problem(400, 'invalid_read_post_id')
+        post = meta('/' + target + '?fields=id,username')
+        if (str(post.get('id')) != target or not isinstance(post.get('username'), str)
+                or post['username'].casefold() != user['username'].casefold()):
+            raise Problem(403, 'insights_own_posts_only')
+        metrics = ('views', 'likes', 'replies', 'reposts', 'quotes')
+        endpoint = '/' + target + '/insights'
+    else:
+        metrics = ('followers_count',)
+        endpoint = '/me/threads_insights'
+    result = meta(endpoint + '?' + urlencode({'metric': ','.join(metrics)}))
+    if not isinstance(result.get('data'), list):
+        raise Problem(502, 'unexpected_meta_insights_response')
+    data = []
+    for row in result['data'][:10]:
+        if not isinstance(row, dict) or row.get('name') not in metrics:
+            raise Problem(502, 'unexpected_meta_insights_response')
+        item = {'name': row['name']}
+        if row.get('period') in ('lifetime', 'day', 'total_over_range'):
+            item['period'] = row['period']
+        values = []
+        entries = row.get('values', [])
+        if not isinstance(entries, list):
+            raise Problem(502, 'unexpected_meta_insights_response')
+        for entry in entries[:100]:
+            if not isinstance(entry, dict) or type(entry.get('value')) not in (int, float):
+                raise Problem(502, 'unexpected_meta_insights_response')
+            value = entry['value']
+            if value < 0 or not math.isfinite(value):
+                raise Problem(502, 'unexpected_meta_insights_response')
+            clean = {'value': value}
+            end = entry.get('end_time')
+            if isinstance(end, str) and len(end) <= 40 and re.fullmatch(r'[0-9T:+.Z-]+', end):
+                clean['end_time'] = end
+            values.append(clean)
+        if values:
+            item['values'] = values
+        total = row.get('total_value', {}).get('value') if isinstance(row.get('total_value'), dict) else None
+        if type(total) in (int, float) and total >= 0 and math.isfinite(total):
+            item['total_value'] = total
+        data.append(item)
+    return {'account': user, 'operation': operation, 'data': data,
+            'post_id': params.get('post_id'), 'observed_at': int(time.time()),
+            'requested_metrics': list(metrics),
+            'missing_metrics': [name for name in metrics if name not in [x['name'] for x in data]]}
+
+
 def read_threads(params):
     """Bounded GET-only discovery. Never follow upstream paging URLs containing tokens."""
     if not isinstance(params, dict) or any(not isinstance(v, str) for v in params.values()):
         raise Problem(400, 'invalid_read_parameters')
     operation = params.get('operation')
+    if operation in ('post_insights', 'account_insights'):
+        return read_insights(params)
     allowed = {'search': {'operation', 'q', 'limit', 'search_type'},
                'post': {'operation', 'post_id'},
                'replies': {'operation', 'post_id', 'limit'},
@@ -355,7 +414,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             if self.path == '/health':
-                return self.respond(200, {'ok': True, 'version': 'explicit-repost-v5'})
+                return self.respond(200, {'ok': True, 'version': 'insights-read-v6', 'read_operations': ['search', 'post', 'replies', 'own_posts', 'post_insights', 'account_insights']})
             if self.path == '/':
                 nonce = secrets.token_urlsafe(24)
                 page = (ROOT / 'publisher.html').read_text().replace('__NONCE__', nonce)
