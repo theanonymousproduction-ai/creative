@@ -21,27 +21,32 @@ class ReadError(Exception):
 
 
 def parameters(job):
-    allowed = {'schema', 'account', 'operation', 'q', 'post_id', 'limit', 'search_type', 'result_recipient_certificate'}
+    allowed = {'schema', 'account', 'operation', 'q', 'post_id', 'post_ids', 'limit', 'search_type', 'result_recipient_certificate'}
     if not isinstance(job, dict) or set(job) - allowed or job.get('schema') != 1 or job.get('account') != ACCOUNT:
         raise ReadError('invalid_read_job')
     operation = job.get('operation')
     cert = job.get('result_recipient_certificate')
     if cert is not None and (not isinstance(cert, str) or len(cert) > 4096 or not cert.startswith('-----BEGIN CERTIFICATE-----') or not cert.strip().endswith('-----END CERTIFICATE-----') or 'PRIVATE KEY' in cert):
         raise ReadError('invalid_result_recipient')
-    if operation in ('post_insights', 'account_insights') and cert is None:
+    if operation in ('post_insights', 'account_insights', 'insights_snapshot') and cert is None:
         raise ReadError('encrypted_result_required_for_insights')
     extras = {'search': {'q', 'limit', 'search_type'}, 'post': {'post_id'},
               'replies': {'post_id', 'limit'}, 'own_posts': {'limit'},
-              'post_insights': {'post_id'}, 'account_insights': set()}
+              'post_insights': {'post_id'}, 'account_insights': set(), 'insights_snapshot': {'post_ids'}}
     if operation not in extras or set(job) - {'schema', 'account', 'operation', 'result_recipient_certificate'} - extras[operation]:
         raise ReadError('invalid_read_operation')
     limit = job.get('limit', 5)
     if type(limit) is not int or not 1 <= limit <= 20:
         raise ReadError('invalid_read_limit')
     result = {'operation': operation}
-    if operation not in ('post', 'post_insights', 'account_insights'):
+    if operation not in ('post', 'post_insights', 'account_insights', 'insights_snapshot'):
         result['limit'] = str(limit)
-    if operation == 'search':
+    if operation == 'insights_snapshot':
+        ids = job.get('post_ids')
+        if not isinstance(ids, list) or not 1 <= len(ids) <= 8 or any(not isinstance(x, str) or not x.isascii() or not x.isdigit() or len(x) > 40 for x in ids) or len(set(ids)) != len(ids):
+            raise ReadError('invalid_snapshot_post_ids')
+        result['post_ids'] = ids
+    elif operation == 'search':
         q = job.get('q')
         ordering = job.get('search_type', 'RECENT')
         if not isinstance(q, str) or not q.strip() or len(q) > 80 or any(ord(c) < 32 for c in q):
@@ -59,6 +64,21 @@ def parameters(job):
 
 def process(job):
     params = parameters(job)
+    if params['operation'] == 'insights_snapshot':
+        # One Actions job; reuse the bounded existing own-post read operations.
+        # Every result is encrypted together by main, including partial failures.
+        posts = []
+        common = {'schema': 1, 'account': ACCOUNT,
+                  'result_recipient_certificate': job['result_recipient_certificate']}
+        for post_id in params['post_ids']:
+            result = process({**common, 'operation': 'post_insights', 'post_id': post_id})
+            posts.append({'post_id': post_id, 'result': result})
+            if result.get('state') != 'read_complete':
+                return {'state': 'blocked', 'operation': 'insights_snapshot',
+                        'post_results': posts, 'error': 'partial_snapshot_stopped'}
+        account = process({**common, 'operation': 'account_insights'})
+        return {'state': account.get('state', 'blocked'), 'operation': 'insights_snapshot',
+                'post_results': posts, 'account_result': account}
     secret = os.environ.get('THREADS_BRIDGE_API_KEY', '').strip()
     if not secret:
         raise ReadError('bridge_secret_missing')
