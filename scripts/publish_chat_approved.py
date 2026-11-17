@@ -10,23 +10,27 @@ import sys
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen, HTTPRedirectHandler, build_opener
 
 BRIDGE = 'https://creative-hl3h.onrender.com'
 EXPECTED_ACCOUNT = 'luen.dayori'
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'integrations/threads-bridge'))
+import media_validation
 
 
 class Stop(Exception):
     pass
 
 
-def fingerprint(account, text, attachment='', reply_to_id=None, repost=None):
+def fingerprint(account, text, attachment='', reply_to_id=None, repost=None, image_url=None, image_sha256=None):
     data = {'account': account, 'text': text, 'attachment': attachment}
     if reply_to_id is not None:
         data['reply_to_id'] = reply_to_id
     if repost is not None:
         data['repost'] = repost
+    if image_url is not None or image_sha256 is not None:
+        data.update(image_url=image_url, image_sha256=image_sha256)
     return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True,
                                     separators=(',', ':')).encode()).hexdigest()
 
@@ -71,7 +75,11 @@ def validate(job):
     repost = validate_repost(job.get('repost'))
     if repost is not None and target is not None:
         raise Stop('repost_only_for_new_main_post')
-    digest = fingerprint(EXPECTED_ACCOUNT, text, attachment, target, repost)
+    try:
+        image = media_validation.validate_image(job)
+    except ValueError as exc:
+        raise Stop(str(exc)) from None
+    digest = fingerprint(EXPECTED_ACCOUNT, text, attachment, target, repost, **image)
     if job.get('sha256') != digest:
         raise Stop('approval_digest_mismatch')
     return digest
@@ -107,8 +115,27 @@ def github(path, token, body=None):
     return json_http('https://api.github.com/repos/' + repo + path, token, body)
 
 
+def verify_image_asset(image):
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    opener = build_opener(NoRedirect())
+    try:
+        with opener.open(Request(image['image_url'], headers={'Accept': 'image/png,image/jpeg'}), timeout=40) as response:
+            raw = response.read(8 * 1024 * 1024 + 1)
+            content_type = response.headers.get_content_type()
+        signature_ok = raw.startswith(b'\x89PNG\r\n\x1a\n') or raw.startswith(b'\xff\xd8\xff')
+        if not raw or len(raw) > 8 * 1024 * 1024 or content_type not in ('image/png', 'image/jpeg') or not signature_ok or hashlib.sha256(raw).hexdigest() != image['image_sha256']:
+            raise Stop('approved_image_bytes_mismatch')
+    except (HTTPError, URLError, TimeoutError, OSError):
+        raise Stop('approved_image_fetch_failed_no_post_sent') from None
+
+
 def process(job):
     digest = validate(job)
+    image = media_validation.validate_image(job)
+    if image:
+        verify_image_asset(image)
     secret = os.environ.get('THREADS_BRIDGE_API_KEY', '').strip()
     gh_token = os.environ.get('GH_TOKEN', '').strip()
     if not secret or not gh_token:
@@ -118,6 +145,7 @@ def process(job):
         raise Stop('wrong_account_or_publishing_switch_off')
     repost = job.get('repost')
     request = {'text': job['text'], 'attachment': job.get('attachment', ''), 'reply_to_id': job.get('reply_to_id')}
+    request.update(image)
     if repost is not None:
         old = github('/deployments/' + str(repost['original_deployment_id']), gh_token)
         old_digest = fingerprint(EXPECTED_ACCOUNT, job['text'], job.get('attachment', ''))
@@ -131,7 +159,9 @@ def process(job):
             raise Stop('repost_original_publication_not_confirmed')
         request['repost'] = repost
     snapshot = bridge('/preview', secret, request)
-    if (snapshot.get('repost') != repost or snapshot.get('reply_to_id') != job.get('reply_to_id') or
+    if (any(snapshot.get(k) != v for k, v in image.items()) or
+        (not image and (snapshot.get('image_url') is not None or snapshot.get('image_sha256') is not None)) or
+        snapshot.get('repost') != repost or snapshot.get('reply_to_id') != job.get('reply_to_id') or
         snapshot.get('text') != job['text'] or
         snapshot.get('attachment', '') != job.get('attachment', '') or
         snapshot.get('account', {}).get('id') != user.get('id') or
@@ -154,7 +184,7 @@ def process(job):
         'production_environment': True,
         'description': 'Chat-approved Threads ' + job['approval_ref'],
         'payload': {'sha256': digest, 'approval_ref': job['approval_ref'], 'account': EXPECTED_ACCOUNT,
-                    **({'repost': repost} if repost is not None else {})}})
+                    **image, **({'repost': repost} if repost is not None else {})}})
     if not isinstance(claim.get('id'), int):
         raise Stop('durable_ledger_claim_failed')
     result = {'approval_ref': job['approval_ref'], 'sha256': digest,
@@ -162,6 +192,7 @@ def process(job):
               'state': 'uncertain', 'post_id': None, 'permalink': None}
     if repost is not None:
         result['repost'] = repost
+    result.update(image)
     try:
         published = bridge('/publish', secret, {'ticket': snapshot['ticket'], 'approved': True})
         if published.get('state') != 'published' or not str(published.get('post_id', '')).isdigit():

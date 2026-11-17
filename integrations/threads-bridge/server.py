@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 API = 'https://graph.threads.net/v1.0'
 ROOT = Path(__file__).resolve().parent
 import threads_oauth
+import media_validation
 
 
 class Problem(Exception):
@@ -276,6 +277,10 @@ def preview(body):
     if not isinstance(attachment, str):
         raise Problem(400, 'invalid_attachment')
     attachment = validate_text(attachment, limit=10000)[0] if attachment.strip() else ''
+    try:
+        image = media_validation.validate_image(body)
+    except ValueError as exc:
+        raise Problem(400, str(exc)) from None
     target = reply_target(body.get('reply_to_id'))
     repost = explicit_repost(body.get('repost'))
     if repost is not None and target is not None:
@@ -285,7 +290,8 @@ def preview(body):
                'reply_to_id': target, 'attachment': attachment, 'expires': int(time.time()) + 600, 'ticket_id': secrets.token_hex(16)}
     if repost is not None:
         payload['repost'] = repost
-    return {'account': user, 'text': text, 'attachment': attachment, 'reply_to_id': target, 'repost': repost, 'counted_units': units,
+    payload.update(image)
+    return {**image, 'account': user, 'text': text, 'attachment': attachment, 'reply_to_id': target, 'repost': repost, 'counted_units': units,
             'ticket': signed_ticket(payload), 'expires_in_seconds': 600}
 
 
@@ -321,11 +327,15 @@ def publish(body):
     user = check_account()
     if payload.get('account_id') != user['id'] or payload.get('username') != user['username']:
         raise Problem(409, 'account_changed_since_preview')
+    try:
+        image = media_validation.validate_image(payload)
+    except ValueError as exc:
+        raise Problem(400, str(exc)) from None
     target = reply_target(payload.get('reply_to_id'))
     repost = explicit_repost(payload.get('repost'))
     if repost is not None and target is not None:
         raise Problem(400, 'repost_only_for_new_main_post')
-    digest = hashlib.sha256((user['id'] + '\0' + text + ('\0attachment\0' + attachment if attachment else '') + ('\0reply\0' + target if target else '') + ('\0explicit-repost\0' + json.dumps(repost, sort_keys=True, separators=(',', ':')) if repost is not None else '')).encode()).hexdigest()
+    digest = hashlib.sha256((user['id'] + '\0' + text + ('\0attachment\0' + attachment if attachment else '') + ('\0image\0' + image['image_url'] + '\0' + image['image_sha256'] if image else '') + ('\0reply\0' + target if target else '') + ('\0explicit-repost\0' + json.dumps(repost, sort_keys=True, separators=(',', ':')) if repost is not None else '')).encode()).hexdigest()
     conn = database()
     try:
         conn.execute('BEGIN IMMEDIATE')
@@ -342,7 +352,9 @@ def publish(body):
         conn.close()
     # From this point any error is retained as uncertain: never automatically retry a post.
     try:
-        form = {'media_type': 'TEXT', 'text': text}
+        form = {'media_type': 'IMAGE' if image else 'TEXT', 'text': text}
+        if image:
+            form['image_url'] = image['image_url']
         if attachment:
             form['text_attachment'] = json.dumps({'plaintext': attachment}, ensure_ascii=False)
         if target:
@@ -441,7 +453,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path.startswith('/oauth/threads'):
                 return self.oauth_get(parsed)
             if self.path == '/health':
-                return self.respond(200, {'ok': True, 'version': 'insights-read-v6', 'read_operations': ['search', 'post', 'replies', 'own_posts', 'post_insights', 'account_insights']})
+                return self.respond(200, {'ok': True, 'version': 'insights-read-v6', 'read_operations': ['search', 'post', 'replies', 'own_posts', 'post_insights', 'account_insights'], 'media_types': ['TEXT', 'IMAGE']})
             if self.path == '/':
                 nonce = secrets.token_urlsafe(24)
                 page = (ROOT / 'publisher.html').read_text().replace('__NONCE__', nonce)
